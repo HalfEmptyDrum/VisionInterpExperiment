@@ -1,0 +1,46 @@
+[
+  {
+    "patch_size": 8,
+    "depth": 2,
+    "d_model": 64,
+    "n_tokens": 65,
+    "params": 109065,
+    "acc": 0.1375,
+    "acc1": 0.35875,
+    "acc_abstract": 0.15333333333333332,
+    "transition_frac": 1.0,
+    "detect_auc": 0.976467986606703,
+    "route_sel": 9.384006261825562e-06,
+    "cls_acc_by_layer": [
+      0.103,
+      0.103,
+      0.103,
+      0.153
+    ],
+    "mechanism_clarity": 0.3333333266666668,
+    "combined": 0.7333333146666672,
+    "pareto": true
+  },
+  {
+    "patch_size": 4,
+    "depth": 2,
+    "d_model": 64,
+    "n_tokens": 257,
+    "params": 118281,
+    "acc": 0.1,
+    "acc1": 0.35375,
+    "acc_abstract": 0.10333333333333333,
+    "transition_frac": 0.0,
+    "detect_auc": 0.988394369232116,
+    "route_sel": 2.1702609956264496e-05,
+    "cls_acc_by_layer": [
+      0.103,
+      0.103,
+      0.103,
+      0.103
+    ],
+    "mechanism_clarity": 0.6666395815700074,
+    "combined": 0.26665583262800296,
+    "pareto": true
+  }
+]

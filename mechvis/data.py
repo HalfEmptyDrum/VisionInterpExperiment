@@ -90,15 +90,23 @@ def _render(
     return img
 
 
-def _patch_counts(centers: np.ndarray, cfg: BlobConfig) -> np.ndarray:
-    """Number of blob *centres* falling in each patch (row-major, length n_patches)."""
-    pc = np.zeros(cfg.n_patches, dtype=np.int64)
-    g, P = cfg.grid, cfg.patch_size
+def centers_to_patch_counts(centers, img_size: int, patch_size: int) -> np.ndarray:
+    """Per-patch blob-centre counts (row-major) at an *arbitrary* patch grid.
+
+    Lets analysis recompute spatial labels at a model's patch resolution, which
+    differs from the data's grid when sweeping ``patch_size``.
+    """
+    g = img_size // patch_size
+    pc = np.zeros(g * g, dtype=np.int64)
     for cx, cy in centers:
-        col = min(int(cx // P), g - 1)
-        row = min(int(cy // P), g - 1)
+        col = min(int(cx // patch_size), g - 1)
+        row = min(int(cy // patch_size), g - 1)
         pc[row * g + col] += 1
     return pc
+
+
+def _patch_counts(centers: np.ndarray, cfg: BlobConfig) -> np.ndarray:
+    return centers_to_patch_counts(centers, cfg.img_size, cfg.patch_size)
 
 
 def make_dataset(cfg: BlobConfig, n: int, seed: Optional[int] = None) -> dict:

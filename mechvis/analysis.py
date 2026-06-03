@@ -32,7 +32,7 @@ import torch
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.metrics import roc_auc_score
 
-from .data import BlobConfig, make_dataset
+from .data import BlobConfig, centers_to_patch_counts, make_dataset
 from .model import HookedViT, load_checkpoint
 from .viz import _to_np
 
@@ -77,12 +77,20 @@ def _split(n, frac=0.7, seed=0):
     return idx[:k], idx[k:]
 
 
+def _zscore_fit(X, tr):
+    """Standardize features using train-split statistics (helps probe convergence)."""
+    mu = X[tr].mean(0)
+    sd = X[tr].std(0) + 1e-6
+    return (X - mu) / sd
+
+
 def probe_clf(X, y, seed=0):
     """Multinomial logistic probe -> held-out accuracy."""
     X = _to_np(X).astype(np.float64)
     y = _to_np(y).astype(np.int64)
     tr, te = _split(len(X), seed=seed)
-    clf = LogisticRegression(max_iter=300, C=1.0)
+    X = _zscore_fit(X, tr)
+    clf = LogisticRegression(max_iter=500, C=1.0)
     clf.fit(X[tr], y[tr])
     return float(clf.score(X[te], y[te]))
 
@@ -92,6 +100,7 @@ def probe_reg_r2(X, y, seed=0):
     X = _to_np(X).astype(np.float64)
     y = _to_np(y).astype(np.float64)
     tr, te = _split(len(X), seed=seed)
+    X = _zscore_fit(X, tr)
     reg = Ridge(alpha=1.0).fit(X[tr], y[tr])
     return float(reg.score(X[te], y[te]))
 
@@ -101,7 +110,8 @@ def probe_auc(X, y, seed=0):
     X = _to_np(X).astype(np.float64)
     y = _to_np(y).astype(np.int64)
     tr, te = _split(len(X), seed=seed)
-    clf = LogisticRegression(max_iter=300, class_weight="balanced")
+    X = _zscore_fit(X, tr)
+    clf = LogisticRegression(max_iter=500, class_weight="balanced")
     clf.fit(X[tr], y[tr])
     return float(roc_auc_score(y[te], clf.decision_function(X[te])))
 
@@ -119,7 +129,10 @@ def run_probes(model, ds, device, n_sub=1500):
     depth = model.cfg.depth
     imgs = ds["images"][:n_sub]
     counts = ds["counts"][:n_sub]
-    pcounts = ds["patch_counts"][:n_sub]  # (N, 64)
+    # recompute per-patch labels at the *model's* patch grid (robust to patch_size sweeps)
+    pcounts = torch.from_numpy(np.stack([
+        centers_to_patch_counts(ds["centers"][i], model.cfg.img_size, model.cfg.patch_size)
+        for i in range(n_sub)]))  # (N, n_patches)
 
     cls_keys = cls_points(depth)
     patch_keys = ["patch_embed"] + [f"blocks.{i}.resid_post" for i in range(depth)]
@@ -139,7 +152,9 @@ def run_probes(model, ds, device, n_sub=1500):
     sel = np.random.default_rng(0).choice(nrow, min(nrow, 40000), replace=False)
     patch_auc, patch_r2 = {}, {}
     for k in patch_keys:
-        Xp = acts[k][:, 1:, :].reshape(nrow, model.cfg.d_model).numpy()[sel]
+        # patch_embed has no CLS (n_patches tokens); resid_* has CLS at 0 (n_patches+1).
+        # Taking the last n_patches tokens selects patch tokens correctly for both.
+        Xp = acts[k][:, -model.cfg.n_patches:, :].reshape(nrow, model.cfg.d_model).numpy()[sel]
         patch_auc[k] = probe_auc(Xp, presence[sel])
         patch_r2[k] = probe_reg_r2(Xp, local_count[sel])
     return {"cls_acc": cls_acc, "logit_lens": lens, "patch_presence_auc": patch_auc,
@@ -191,7 +206,9 @@ def patch_embed_filters(model, path=f"{FIG}/patch_filters.png", n=32):
 @torch.no_grad()
 def attention_routing(model, ds, device, n_sub=512):
     imgs = ds["images"][:n_sub].to(device)
-    presence = (ds["patch_counts"][:n_sub] > 0).float()  # (N, 64)
+    pc = np.stack([centers_to_patch_counts(ds["centers"][i], model.cfg.img_size, model.cfg.patch_size)
+                   for i in range(n_sub)])
+    presence = (torch.from_numpy(pc) > 0).float()  # (N, n_patches) at model grid
     base_rate = presence.mean().item()  # fraction of patches that contain a blob
     _, cache = model.run_with_cache(imgs)
     depth, H = model.cfg.depth, model.cfg.n_heads
