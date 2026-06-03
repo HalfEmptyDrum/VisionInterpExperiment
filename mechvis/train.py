@@ -62,7 +62,9 @@ def fit(model, train, val, device, epochs=40, bs=256, lr=3e-4, wd=0.01,
     n_train = len(Xtr)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     steps = epochs * ((n_train + bs - 1) // bs)
-    sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps, pct_start=0.1)
+    # OneCycle needs enough steps to define its warmup; fall back to constant LR for tiny runs
+    sched = (torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=lr, total_steps=steps, pct_start=0.1)
+             if steps >= 20 else None)
     g = torch.Generator().manual_seed(seed)
 
     best = {"acc": -1.0}
@@ -78,7 +80,8 @@ def fit(model, train, val, device, epochs=40, bs=256, lr=3e-4, wd=0.01,
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
-            sched.step()
+            if sched is not None:
+                sched.step()
             running += loss.item() * xb.size(0)
         acc, acc1, per = evaluate(model, val["images"], val["counts"], device)
         history.append((running / n_train, acc, acc1))

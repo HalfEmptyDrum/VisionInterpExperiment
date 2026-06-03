@@ -32,6 +32,7 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from einops import rearrange
 
 
@@ -82,13 +83,17 @@ class Attention(nn.Module):
         H, dh = self.cfg.n_heads, self.cfg.d_head
         qkv = self.qkv(x).reshape(B, T, 3, H, dh).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, T, dh)
+        if cache is None and hooks is None:
+            # fast path: fused attention (flash on CUDA); never materializes the
+            # B x H x T x T probability tensor. Numerically equal to the explicit
+            # path below, so training/eval results are unchanged.
+            z = F.scaled_dot_product_attention(q, k, v).transpose(1, 2)  # (B, T, H, dh)
+            return self.proj(z.reshape(B, T, D))
+        # explicit path: exposes / hooks the attention pattern and z for interpretability
         attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, T, T)
-        pattern = attn.softmax(dim=-1)
-        pattern = _apply(prefix + "pattern", pattern, cache, hooks)
-        z = pattern @ v  # (B, H, T, dh)
-        z = _apply(prefix + "z", z.transpose(1, 2), cache, hooks)  # (B, T, H, dh)
-        out = self.proj(z.reshape(B, T, D))  # head-major concat
-        return out
+        pattern = _apply(prefix + "pattern", attn.softmax(dim=-1), cache, hooks)
+        z = _apply(prefix + "z", (pattern @ v).transpose(1, 2), cache, hooks)  # (B, T, H, dh)
+        return self.proj(z.reshape(B, T, D))
 
 
 class Block(nn.Module):

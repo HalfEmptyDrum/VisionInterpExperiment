@@ -50,11 +50,17 @@ def bs_for(patch):
     return 128 if patch == 4 else 256
 
 
+def _dev_factor():
+    # CUDA is ~20x faster than MPS for these shapes; shrink estimates so the
+    # deadline guard does not wrongly skip runs on GPU.
+    return 0.05 if torch.cuda.is_available() else 1.0
+
+
 def est_seconds(patch, depth, width, n_train, epochs):
-    """Conservative wall-time estimate (s) calibrated to measured throughput."""
-    a, wf = (10.3, {64: 0.63}) if patch == 8 else (48.0, {64: 0.7})
+    """Conservative wall-time estimate (s), calibrated to observed throughput."""
+    a, wf = (31.0, {64: 0.63}) if patch == 8 else (150.0, {64: 0.7})  # observed on MPS
     spe40 = a * depth * wf.get(width, width / 128.0)
-    return spe40 * (n_train / 40000.0) * epochs * 1.3  # 30% safety margin
+    return spe40 * (n_train / 40000.0) * epochs * 1.25 * _dev_factor()
 
 
 def tag_of(patch, depth, width):
@@ -131,12 +137,12 @@ def grok_summary(hist):
             "grokked": bool(mem and gen and (gen - mem) >= 1000)}
 
 
-def run_grok(n_train, wd, lr, steps, data, deadline, reserve, groks):
-    tag = f"grok_n{n_train}_wd{wd}_lr{lr}"
+def run_grok(n_train, wd, lr, steps, data, deadline, reserve, groks, depth=2, width=64):
+    tag = f"grok_n{n_train}_wd{wd}_d{depth}w{width}"
     if any(g["tag"] == tag for g in groks):
         log(f"skip {tag} (already done)")
         return
-    est = steps * 0.2 * 1.3
+    est = steps * 0.45 * 1.2 * _dev_factor()  # ~0.3-0.45 s/step on MPS; far less on CUDA
     if time.time() + est > deadline - reserve:
         log(f"SKIP {tag}: est {est/60:.0f}min exceeds remaining budget")
         return
@@ -145,7 +151,7 @@ def run_grok(n_train, wd, lr, steps, data, deadline, reserve, groks):
     model = None
     try:
         torch.manual_seed(0)
-        mcfg = ViTConfig(img_size=64, patch_size=8, in_ch=1, d_model=128, depth=3, n_heads=4, n_classes=9)
+        mcfg = ViTConfig(img_size=64, patch_size=8, in_ch=1, d_model=width, depth=depth, n_heads=4, n_classes=9)
         model = HookedViT(mcfg).to(device)
         sub = {"images": train["images"][:n_train], "counts": train["counts"][:n_train]}
         t0 = time.time()
@@ -270,8 +276,12 @@ figcaption{color:var(--mut);font-size:12.5px;margin-top:8px}
 
 def write_report(agg, full, device_name, groks):
     rt = (time.time() - START) / 3600
-    best_acc = max(agg, key=lambda r: r["acc"])
-    best_comb = max(agg, key=lambda r: r["combined"])
+    if not agg:  # pathological: every sweep run skipped/failed -> still emit a (grok-only) report
+        best_acc = best_comb = {"tag": "n/a", "acc": float("nan"), "acc_std": float("nan"),
+                                "mechanism_clarity": float("nan")}
+    else:
+        best_acc = max(agg, key=lambda r: r["acc"])
+        best_comb = max(agg, key=lambda r: r["combined"])
 
     trs = ""
     for r in sorted(agg, key=lambda r: -r["combined"]):
@@ -368,7 +378,7 @@ def write_report(agg, full, device_name, groks):
                    f'<td>{g["memorize_step"]}</td><td>{g["generalize_step"]}</td>'
                    f'<td>{g["grok_gap"]}</td><td>{"yes" if g["grokked"] else "no"}</td></tr>')
         gt += '</tbody></table>'
-        body += (f'<h2>Grokking search</h2><p class="note">Baseline patch-8/d3/w128 on a small memorizable '
+        body += (f'<h2>Grokking search</h2><p class="note">A small patch-8 model on a small memorizable '
                  f'train set, constant LR, strong weight decay, plain CE. "grokked" = train≥0.95 then '
                  f'val≥0.60 with a ≥1000-step gap.</p>{gt}'
                  f'<figure>{_img("figures/grok_curves.png")}<figcaption>Train (blue) vs val (red) accuracy '
@@ -410,6 +420,13 @@ def main():
     ap.add_argument("--epochs", type=int, default=50)
     ap.add_argument("--n_train", type=int, default=40000)
     ap.add_argument("--grok_steps", type=int, default=12000)
+    ap.add_argument("--grok_wds", type=float, nargs="+", default=[1.0, 0.1])
+    ap.add_argument("--grok_sizes", type=int, nargs="+", default=[500, 1000])
+    ap.add_argument("--grok_depth", type=int, default=2)
+    ap.add_argument("--grok_width", type=int, default=64)
+    ap.add_argument("--sweep_patches", type=int, nargs="+", default=[8])
+    ap.add_argument("--sweep_depths", type=int, nargs="+", default=[2, 3, 4])
+    ap.add_argument("--sweep_widths", type=int, nargs="+", default=[64, 128])
     args = ap.parse_args()
     device = pick_device("auto")
     deadline = START + args.budget_hours * 3600
@@ -430,31 +447,23 @@ def main():
     def R(p, d, w, ep=args.epochs, nt=args.n_train, seed=0):
         run_one(p, d, w, ep, nt, seed, data, deadline, reserve, results)
 
-    # 1) patch-8 grid (core)
-    log("=== stage 1: patch-8 grid ===")
-    for w in (64, 128):
-        for d in (2, 3, 4):
-            R(8, d, w)
-    # 2) grokking search (small data + strong weight decay + long constant-LR training)
-    log("=== stage 2: grokking search ===")
-    for nt, wd, lr in [(1000, 1.0, 1e-3), (1000, 0.1, 1e-3), (500, 1.0, 1e-3)]:
-        run_grok(nt, wd, lr, args.grok_steps, data, deadline, reserve, groks)
-    # 3) one patch-4 datapoint (does finer resolution help accuracy?)
-    log("=== stage 3: patch-4 datapoint ===")
-    R(4, 3, 128, ep=35, nt=30000)
-    # 3) multi-seed top-2 patch-8 configs by combined
-    log("=== stage 3: multi-seed top-2 patch-8 ===")
-    agg = aggregate(results)
-    p8 = sorted([r for r in agg if r["patch_size"] == 8], key=lambda r: -r["combined"])[:2]
-    for r in p8:
+    # 1) grokking phase-diagram FIRST (user priority -> guaranteed budget): wd x train-size
+    log("=== stage 1: grokking search ===")
+    for wd in args.grok_wds:
+        for nt in args.grok_sizes:
+            run_grok(nt, wd, 1e-3, args.grok_steps, data, deadline, reserve, groks,
+                     depth=args.grok_depth, width=args.grok_width)
+    # 2) architecture sweep grid (deadline guard trims to whatever fits)
+    log("=== stage 2: architecture sweep ===")
+    for p in args.sweep_patches:
+        for w in args.sweep_widths:
+            for d in args.sweep_depths:
+                R(p, d, w)
+    # 3) multi-seed the top-2 configs by combined score
+    log("=== stage 3: multi-seed top-2 ===")
+    for r in sorted(aggregate(results), key=lambda r: -r["combined"])[:2]:
         for seed in (1, 2):
-            R(8, r["depth"], r["d_model"], seed=seed)
-    # 4) bonus: patch-4 d4 + extra patch-8 variants
-    log("=== stage 4: bonus configs ===")
-    R(4, 4, 128, ep=30, nt=30000)
-    R(8, 1, 128)
-    R(8, 6, 128)
-    R(8, 3, 256)
+            R(r["patch_size"], r["depth"], r["d_model"], seed=seed)
 
     # finalize: scoring, plots, full analysis on winner, report
     log("=== finalize ===")
@@ -464,14 +473,17 @@ def main():
         grok_plot(groks)
     except Exception:
         log(f"plot failed:\n{traceback.format_exc()}")
-    winner = max(agg, key=lambda r: r["combined"])
-    log(f"winner by combined: {winner['tag']} (acc {winner['acc']:.3f}, clarity {winner['mechanism_clarity']:.3f})")
     full = None
-    try:
-        if winner.get("best_ckpt"):
-            full = full_analysis(winner["best_ckpt"], device)
-    except Exception:
-        log(f"full analysis failed:\n{traceback.format_exc()}")
+    if agg:
+        winner = max(agg, key=lambda r: r["combined"])
+        log(f"winner by combined: {winner['tag']} (acc {winner['acc']:.3f}, clarity {winner['mechanism_clarity']:.3f})")
+        try:
+            if winner.get("best_ckpt"):
+                full = full_analysis(winner["best_ckpt"], device)
+        except Exception:
+            log(f"full analysis failed:\n{traceback.format_exc()}")
+    else:
+        log("no sweep configs completed")
     write_report(agg, full, device, groks)
     log("ALL DONE")
 
